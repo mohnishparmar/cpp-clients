@@ -59,7 +59,7 @@ StreamingS2SClient::StreamingS2SClient(
     std::string output_filename, std::string model_name, bool simulate_realtime,
     bool verbatim_transcripts, const std::string& boosted_phrases_file, float boosted_phrases_score,
     const std::string& tts_encoding, const std::string& tts_audio_file, int tts_sample_rate,
-    const std::string& tts_voice_name)
+    const std::string& tts_voice_name, bool verbose)
     : print_latency_stats_(true), stub_(nr_nmt::RivaTranslation::NewStub(channel)),
       language_code_(language_code), max_alternatives_(max_alternatives),
       profanity_filter_(profanity_filter), word_time_offsets_(word_time_offsets),
@@ -70,7 +70,7 @@ StreamingS2SClient::StreamingS2SClient(
       model_name_(model_name), simulate_realtime_(simulate_realtime),
       verbatim_transcripts_(verbatim_transcripts), boosted_phrases_score_(boosted_phrases_score),
       tts_encoding_(tts_encoding), tts_audio_file_(tts_audio_file), tts_voice_name_(tts_voice_name),
-      tts_sample_rate_(tts_sample_rate)
+      tts_sample_rate_(tts_sample_rate), verbose_(verbose)
 {
   num_active_streams_.store(0);
   num_streams_finished_.store(0);
@@ -318,7 +318,12 @@ StreamingS2SClient::ReceiveResponses(std::shared_ptr<S2SClientCall> call, bool a
   std::vector<int16_t> pcm_buffer;
   std::vector<unsigned char> opus_buffer;
   while (call->streamer->Read(&call->response)) {  // Returns false when no more to read.
-    auto size = call->response.speech().audio().length();
+    if (!call->response.speech().audio().length()) {
+      if (verbose_) {
+        std::cout << "Got 0 bytes back from server.Sentence Completed." << std::endl;
+      }
+      continue;
+    }
     call->recv_times.push_back(std::chrono::steady_clock::now());
     auto audio = call->response.speech().audio();
     if (audio_device) {
@@ -327,18 +332,15 @@ StreamingS2SClient::ReceiveResponses(std::shared_ptr<S2SClientCall> call, bool a
       gotoxy(0, 5);
     }
 
-    std::cout << "Got " << audio.length() << " bytes back from server"
-              << (size == 0 ? "(COMPLETED)" : "") << std::endl;
-    if (size > 0) {
-      if (tts_encoding_.empty() || tts_encoding_ == "pcm") {
-        int16_t* pcm_data = (int16_t*)audio.data();
-        size_t len = audio.length() / sizeof(int16_t);
-        std::copy(pcm_data, pcm_data + len, std::back_inserter(pcm_buffer));
-      } else if (tts_encoding_ == "opus") {
-        const unsigned char* opus_data = (unsigned char*)audio.data();
-        size_t len = audio.length();
-        std::copy(opus_data, opus_data + len, std::back_inserter(opus_buffer));
-      }
+    std::cout << "Got " << audio.length() << " bytes back from server" << std::endl;
+    if (tts_encoding_.empty() || tts_encoding_ == "pcm") {
+      int16_t* pcm_data = (int16_t*)audio.data();
+      size_t len = audio.length() / sizeof(int16_t);
+      std::copy(pcm_data, pcm_data + len, std::back_inserter(pcm_buffer));
+    } else if (tts_encoding_ == "opus") {
+      const unsigned char* opus_data = (unsigned char*)audio.data();
+      size_t len = audio.length();
+      std::copy(opus_data, opus_data + len, std::back_inserter(opus_buffer));
     }
   }
 
