@@ -29,6 +29,8 @@ namespace nr = nvidia::riva;
 namespace nr_tts = nvidia::riva::tts;
 
 DEFINE_string(text, "", "Text to be synthesized");
+DEFINE_string(
+    text_file, "", "Text file with list of sentences to be synthesized. Ignored if 'text' is set.");
 DEFINE_string(audio_file, "output.wav", "Output file");
 DEFINE_string(audio_encoding, "pcm", "Audio encoding (pcm or opus)");
 DEFINE_string(riva_uri, "localhost:50051", "Riva API server URI and port");
@@ -101,6 +103,7 @@ main(int argc, char** argv)
   std::stringstream str_usage;
   str_usage << "Usage: riva_tts_client " << std::endl;
   str_usage << "           --text=<text> " << std::endl;
+  str_usage << "           --text_file=<filename> " << std::endl;
   str_usage << "           --audio_file=<filename> " << std::endl;
   str_usage << "           --audio_encoding=<pcm|opus> " << std::endl;
   str_usage << "           --riva_uri=<server_name:port> " << std::endl;
@@ -134,9 +137,25 @@ main(int argc, char** argv)
   }
 
   auto text = FLAGS_text;
-  if (text.length() == 0) {
-    LOG(ERROR) << "Input text cannot be empty." << std::endl;
+  auto text_file = FLAGS_text_file;
+  std::vector<std::string> text_lines;
+  if (text.length() == 0 && text_file.length() == 0) {
+    LOG(ERROR) << "Input text or text file cannot be empty." << std::endl;
     return -1;
+  }
+  if (text.length() > 0 && text_file.length() > 0) {
+    LOG(ERROR) << "Only one of text or text file can be provided." << std::endl;
+    return -1;
+  }
+  if (text_file.length() > 0) {
+    std::ifstream infile(text_file);
+    if (infile.is_open()) {
+      std::string line;
+      while (std::getline(infile, line)) {
+        text_lines.push_back(line);
+        text += line + " ";
+      }
+    }
   }
 
   bool flag_set = gflags::GetCommandLineFlagInfoOrDie("riva_uri").is_default;
@@ -152,7 +171,8 @@ main(int argc, char** argv)
     auto creds = riva::clients::CreateChannelCredentials(
         FLAGS_use_ssl, FLAGS_ssl_root_cert, FLAGS_ssl_client_key, FLAGS_ssl_client_cert,
         FLAGS_metadata);
-    grpc_channel = riva::clients::CreateChannelBlocking(FLAGS_riva_uri, creds, FLAGS_timeout_ms, FLAGS_max_grpc_message_size);
+    grpc_channel = riva::clients::CreateChannelBlocking(
+        FLAGS_riva_uri, creds, FLAGS_timeout_ms, FLAGS_max_grpc_message_size);
   }
   catch (const std::exception& e) {
     std::cerr << "Error creating GRPC channel: " << e.what() << std::endl;
@@ -251,7 +271,7 @@ main(int argc, char** argv)
           decoder.DeserializeOpus(std::vector<unsigned char>(ptr, ptr + audio.size())));
       ::riva::utils::wav::Write(FLAGS_audio_file, rate, pcm.data(), pcm.size());
     }
-  } else {  // online inference
+  } else if (FLAGS_online && text_lines.size() == 0) {  // if text_lines is empty, the query is already stored in the request object
     if (not FLAGS_zero_shot_transcript.empty()) {
       LOG(ERROR) << "Zero shot transcript is not supported for streaming inference.";
       return -1;
@@ -261,8 +281,11 @@ main(int argc, char** argv)
     size_t audio_len = 0;
     nr_tts::SynthesizeSpeechResponse chunk;
     auto start = std::chrono::steady_clock::now();
-    std::unique_ptr<grpc::ClientReader<nr_tts::SynthesizeSpeechResponse>> reader(
-        tts->SynthesizeOnline(&context, request));
+    std::unique_ptr<
+        grpc::ClientReaderWriter<nr_tts::SynthesizeSpeechRequest, nr_tts::SynthesizeSpeechResponse>>
+        reader(tts->SynthesizeOnline(&context));
+    reader->Write(request);
+    reader->WritesDone();
     while (reader->Read(&chunk)) {
       // Copy chunk to local buffer
       if (audio_len == 0) {
@@ -291,6 +314,64 @@ main(int argc, char** argv)
     if (!rpc_status.ok()) {
       // Report the RPC failure.
       LOG(ERROR) << rpc_status.error_message() << std::endl;
+      LOG(ERROR) << "Input was: \'" << text << "\'" << std::endl;
+      return -1;
+    }
+
+    if (FLAGS_audio_encoding.empty() || FLAGS_audio_encoding == "pcm") {
+      ::riva::utils::wav::Write(FLAGS_audio_file, rate, pcm_buffer.data(), pcm_buffer.size());
+    } else if (FLAGS_audio_encoding == "opus") {
+      riva::utils::opus::Decoder decoder(rate, 1);
+      auto pcm = decoder.DecodePcm(decoder.DeserializeOpus(opus_buffer));
+      ::riva::utils::wav::Write(FLAGS_audio_file, rate, pcm.data(), pcm.size());
+    }
+  } else if (FLAGS_online && text_lines.size() > 0) {  // streaming inference
+    std::vector<int16_t> pcm_buffer;
+    std::vector<unsigned char> opus_buffer;
+    size_t audio_len = 0;
+    nr_tts::SynthesizeSpeechResponse chunk;
+    auto start = std::chrono::steady_clock::now();
+    std::unique_ptr<
+        grpc::ClientReaderWriter<nr_tts::SynthesizeSpeechRequest, nr_tts::SynthesizeSpeechResponse>>
+        reader(tts->SynthesizeOnline(&context));
+    for (const auto& line : text_lines) {
+      if (line.find("|") != std::string::npos) {
+        request.set_text(line.substr(line.find("|") + 1, line.length()));
+      } else {
+        request.set_text(line);
+      }
+      reader->Write(request);
+    }
+    reader->WritesDone();
+    while (reader->Read(&chunk)) {
+      // Copy chunk to local buffer
+      if (audio_len == 0) {
+        auto t_first_audio = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed_first_audio = t_first_audio - start;
+        LOG(INFO) << "Time to first chunk: " << elapsed_first_audio.count() << " s" << std::endl;
+      }
+      LOG(INFO) << "Got chunk: " << chunk.audio().size() << " bytes" << std::endl;
+      if (FLAGS_audio_encoding.empty() || FLAGS_audio_encoding == "pcm") {
+        int16_t* audio_data = (int16_t*)chunk.audio().data();
+        size_t len = chunk.audio().length() / sizeof(int16_t);
+        std::copy(audio_data, audio_data + len, std::back_inserter(pcm_buffer));
+        audio_len += len;
+      } else if (FLAGS_audio_encoding == "opus") {
+        const unsigned char* opus_data = (unsigned char*)chunk.audio().data();
+        size_t len = chunk.audio().length();
+        std::copy(opus_data, opus_data + len, std::back_inserter(opus_buffer));
+        audio_len += len;
+      }
+    }
+    grpc::Status rpc_status = reader->Finish();
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed_total = end - start;
+    LOG(INFO) << "Total streaming time: " << elapsed_total.count() << " s" << std::endl;
+
+    if (!rpc_status.ok()) {
+      // Report the RPC failure.
+      LOG(ERROR) << rpc_status.error_message() << std::endl;
+      LOG(ERROR) << "Input was: " << text_lines.size() << " lines." << std::endl;
       LOG(ERROR) << "Input was: \'" << text << "\'" << std::endl;
       return -1;
     }
